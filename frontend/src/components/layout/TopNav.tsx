@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { 
   ShoppingCart, 
   ChevronDown, 
@@ -8,7 +8,8 @@ import {
   Bell, 
   Menu,
   Check,
-  Server
+  Server,
+  RefreshCw
 } from 'lucide-react';
 import { SystemStatus } from '../../types';
 import { checkBackendHealth, getApiMode, setApiMode, BackendHealth, ApiMode } from '../../services/api';
@@ -30,6 +31,10 @@ export const TopNav: React.FC<TopNavProps> = ({
   const [selectedWorkspace, setSelectedWorkspace] = useState('NovaMart');
   const [apiMode, setMode] = useState<ApiMode>(getApiMode());
   const [health, setHealth] = useState<BackendHealth | null>(null);
+  const [isChecking, setIsChecking] = useState<boolean>(true);
+  const [consecutiveFailures, setConsecutiveFailures] = useState<number>(0);
+
+  const retryTimeoutRef = useRef<any>(null);
 
   const workspaces = [
     { name: 'NovaMart', subtitle: 'E-commerce Analytics', active: true },
@@ -37,28 +42,69 @@ export const TopNav: React.FC<TopNavProps> = ({
     { name: 'NovaLogistics', subtitle: 'Fulfillment & Fleet', active: false },
   ];
 
+  const performHealthCheck = async (timeoutMs: number = 15000) => {
+    setIsChecking(true);
+    try {
+      const res = await checkBackendHealth(timeoutMs);
+      setHealth(res);
+      if (res.online) {
+        setConsecutiveFailures(0);
+      } else {
+        setConsecutiveFailures(prev => prev + 1);
+      }
+      return res;
+    } catch {
+      setConsecutiveFailures(prev => prev + 1);
+      return null;
+    } finally {
+      setIsChecking(false);
+    }
+  };
+
   useEffect(() => {
     let mounted = true;
-    const pollHealth = async () => {
-      const res = await checkBackendHealth();
-      if (mounted) setHealth(res);
+
+    const scheduleNextCheck = (delayMs: number) => {
+      if (retryTimeoutRef.current) clearTimeout(retryTimeoutRef.current);
+      retryTimeoutRef.current = setTimeout(async () => {
+        if (!mounted) return;
+        const res = await performHealthCheck();
+        if (!mounted) return;
+
+        // Backoff: if offline/waking, retry sooner (4s, 8s, 15s); if online, steady poll every 15s
+        if (res && res.online) {
+          scheduleNextCheck(15000);
+        } else {
+          const nextDelay = Math.min(4000 * Math.pow(1.5, consecutiveFailures), 15000);
+          scheduleNextCheck(nextDelay);
+        }
+      }, delayMs);
     };
 
-    pollHealth();
-    const interval = setInterval(pollHealth, 10000);
+    // Immediate initial check
+    performHealthCheck().then((res) => {
+      if (mounted) {
+        scheduleNextCheck(res && res.online ? 15000 : 4000);
+      }
+    });
 
     const handleModeChange = (e: any) => {
       setMode(e.detail || getApiMode());
-      pollHealth();
+      performHealthCheck();
     };
 
     window.addEventListener('tribalsql_api_mode_change', handleModeChange);
     return () => {
       mounted = false;
-      clearInterval(interval);
+      if (retryTimeoutRef.current) clearTimeout(retryTimeoutRef.current);
       window.removeEventListener('tribalsql_api_mode_change', handleModeChange);
     };
-  }, []);
+  }, [consecutiveFailures]);
+
+  const handleManualReconnect = async () => {
+    if (isChecking) return;
+    await performHealthCheck(15000);
+  };
 
   const toggleApiMode = () => {
     const nextMode: ApiMode = apiMode === 'live' ? 'mock' : 'live';
@@ -68,6 +114,9 @@ export const TopNav: React.FC<TopNavProps> = ({
 
   const isLive = apiMode === 'live';
   const isOnline = health?.online ?? false;
+  // Waking if timeout occurred, or initial check in progress, or transient failure under 3 attempts
+  const isWaking = isLive && !isOnline && (health?.isWaking || isChecking || consecutiveFailures < 3);
+
   const dbEngine = health?.engine?.toUpperCase() || (systemStatus.postgresql.status === 'connected' ? 'POSTGRESQL' : 'SQLITE');
 
   return (
@@ -125,20 +174,58 @@ export const TopNav: React.FC<TopNavProps> = ({
 
       {/* Right side: Status Badges & User Profile */}
       <div className="flex items-center gap-3 sm:gap-5">
-        {/* API Mode Toggle Button */}
-        <button
-          onClick={toggleApiMode}
-          title={`Click to switch to ${isLive ? 'Mock' : 'Live'} Mode`}
-          className={`flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-bold transition-all cursor-pointer border ${
-            isLive 
-              ? (isOnline ? 'bg-emerald-50 text-emerald-700 border-emerald-300 hover:bg-emerald-100' : 'bg-rose-50 text-rose-700 border-rose-300 hover:bg-rose-100')
-              : 'bg-amber-50 text-amber-800 border-amber-300 hover:bg-amber-100'
-          }`}
-        >
-          <Server className="w-3 h-3" />
-          <span>{isLive ? (isOnline ? 'LIVE MODE (FastAPI)' : 'LIVE MODE (Offline)') : 'MOCK MODE'}</span>
-          <span className={`w-2 h-2 rounded-full ${isLive ? (isOnline ? 'bg-emerald-500 animate-pulse' : 'bg-rose-500') : 'bg-amber-500'}`} />
-        </button>
+        {/* API Mode / Live Connection Badge with Manual Reconnect */}
+        <div className="flex items-center gap-1.5">
+          <button
+            onClick={isOnline ? toggleApiMode : handleManualReconnect}
+            title={
+              !isOnline && isLive
+                ? (isWaking ? 'Render container waking up. Click to reconnect immediately.' : 'Backend unreachable. Click to retry connection.')
+                : `Click to switch to ${isLive ? 'Mock' : 'Live'} Mode`
+            }
+            className={`flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-bold transition-all cursor-pointer border ${
+              isLive 
+                ? (isOnline 
+                    ? 'bg-emerald-50 text-emerald-700 border-emerald-300 hover:bg-emerald-100' 
+                    : (isWaking 
+                        ? 'bg-amber-50 text-amber-800 border-amber-300 hover:bg-amber-100' 
+                        : 'bg-rose-50 text-rose-700 border-rose-300 hover:bg-rose-100'))
+                : 'bg-amber-50 text-amber-800 border-amber-300 hover:bg-amber-100'
+            }`}
+          >
+            {isWaking ? (
+              <RefreshCw className="w-3 h-3 text-amber-600 animate-spin" />
+            ) : (
+              <Server className="w-3 h-3" />
+            )}
+            <span>
+              {isLive 
+                ? (isOnline 
+                    ? 'LIVE MODE (FastAPI)' 
+                    : (isWaking ? 'Waking backend...' : 'LIVE MODE (Offline)')) 
+                : 'MOCK MODE'}
+            </span>
+            <span className={`w-2 h-2 rounded-full ${
+              isLive 
+                ? (isOnline 
+                    ? 'bg-emerald-500 animate-pulse' 
+                    : (isWaking ? 'bg-amber-500 animate-pulse' : 'bg-rose-500')) 
+                : 'bg-amber-500'
+            }`} />
+          </button>
+
+          {/* Quick Manual Reconnect button if waking or offline */}
+          {isLive && !isOnline && (
+            <button
+              onClick={handleManualReconnect}
+              disabled={isChecking}
+              title="Click to reconnect to backend immediately"
+              className="p-1.5 rounded-full bg-white border border-[#E4EAEA] shadow-2xs hover:bg-[#F5F7F7] text-[#64748B] hover:text-[#142337] transition-all cursor-pointer disabled:opacity-50"
+            >
+              <RefreshCw className={`w-3.5 h-3.5 ${isChecking ? 'animate-spin text-[#F45B0B]' : ''}`} />
+            </button>
+          )}
+        </div>
 
         {/* Database Status */}
         <div className="hidden sm:flex items-center gap-2">
@@ -148,10 +235,14 @@ export const TopNav: React.FC<TopNavProps> = ({
           <div className="text-left text-xs">
             <div className="flex items-center gap-1">
               <span className="font-bold text-[#142337]">{dbEngine}</span>
-              <span className={`w-1.5 h-1.5 rounded-full ${isOnline ? 'bg-[#16A36A]' : 'bg-gray-400'}`} />
+              <span className={`w-1.5 h-1.5 rounded-full ${
+                isOnline ? 'bg-[#16A36A]' : (isWaking ? 'bg-amber-500 animate-pulse' : 'bg-rose-400')
+              }`} />
             </div>
             <p className="text-[10px] text-[#64748B]">
-              {isOnline ? 'Connected' : (isLive ? 'Unreachable' : 'Simulated')}
+              {isOnline 
+                ? 'Connected' 
+                : (isWaking ? 'Waking...' : (isLive ? 'Unreachable' : 'Simulated'))}
             </p>
           </div>
         </div>
@@ -166,10 +257,18 @@ export const TopNav: React.FC<TopNavProps> = ({
               <span className="font-bold text-[#142337]">Memory</span>
             </div>
             <p className={`text-[10px] font-semibold flex items-center gap-1 ${
-              health?.hindsightConfigured ? 'text-[#16A36A]' : 'text-amber-700'
+              isOnline && health?.hindsightConfigured 
+                ? 'text-[#16A36A]' 
+                : (isWaking ? 'text-amber-700' : (isOnline ? 'text-amber-700' : 'text-gray-500'))
             }`}>
-              <span className={`w-1.5 h-1.5 rounded-full ${health?.hindsightConfigured ? 'bg-[#16A36A]' : 'bg-amber-500'}`} />
-              {health?.hindsightConfigured ? 'Cloud Active' : (isOnline ? 'Local Fallback' : 'Simulated')}
+              <span className={`w-1.5 h-1.5 rounded-full ${
+                isOnline && health?.hindsightConfigured 
+                  ? 'bg-[#16A36A]' 
+                  : (isWaking ? 'bg-amber-500 animate-pulse' : (isOnline ? 'bg-amber-500' : 'bg-gray-400'))
+              }`} />
+              {isOnline 
+                ? (health?.hindsightConfigured ? 'Cloud Active' : 'Local Fallback') 
+                : (isWaking ? 'Connecting...' : (isLive ? 'Unavailable' : 'Simulated'))}
             </p>
           </div>
         </div>
@@ -184,7 +283,9 @@ export const TopNav: React.FC<TopNavProps> = ({
               <span className="font-bold text-[#142337]">Groq LLM</span>
             </div>
             <p className="text-[10px] text-[#64748B] font-mono">
-              {health?.primaryModel || systemStatus.groq.model}
+              {isOnline 
+                ? (health?.primaryModel || systemStatus.groq.model) 
+                : (isWaking ? 'Connecting...' : (isLive ? 'Unavailable' : 'Simulated'))}
             </p>
           </div>
         </div>

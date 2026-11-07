@@ -537,3 +537,4 @@ def get_dashboard_analytics(days: int = 7) -> Dict[str, Any]:
         "memoryInsights": memory_insights,
         "hindsight": hindsight_stats
     }
+

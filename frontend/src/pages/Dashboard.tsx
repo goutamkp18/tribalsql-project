@@ -94,6 +94,27 @@ export const Dashboard: React.FC<DashboardProps> = ({
             model: health.primaryModel || 'openai/gpt-oss-120b',
           },
         });
+      } else if (health.isWaking) {
+        setSystemStatus({
+          postgresql: {
+            status: 'reconnecting',
+            label: 'Waking backend...',
+            database: 'postgres',
+            host: 'aws-0-ap-southeast-2.pooler.supabase.com',
+            latencyMs: 0,
+          },
+          hindsight: {
+            status: 'offline',
+            label: 'Connecting...',
+            memoriesRetained: 0,
+            cloudRegion: 'us-east (Vectorize)',
+          },
+          groq: {
+            status: 'busy',
+            label: 'Connecting...',
+            model: 'openai/gpt-oss-120b',
+          },
+        });
       }
     } catch (err: any) {
       console.error('Failed to load dashboard analytics:', err);

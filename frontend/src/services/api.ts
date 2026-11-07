@@ -34,6 +34,7 @@ export interface ApiResponse<T> {
 
 export interface BackendHealth {
   online: boolean;
+  isWaking?: boolean;
   engine: string;
   databaseUrl?: string;
   hindsightBank: string;
@@ -45,11 +46,12 @@ export interface BackendHealth {
 
 /**
  * Checks connectivity to the root FastAPI backend (/health).
+ * Supports configurable timeout (default: 15,000ms / 15 seconds to accommodate Render free-tier cold starts).
  */
-export async function checkBackendHealth(): Promise<BackendHealth> {
+export async function checkBackendHealth(timeoutMs: number = 15000): Promise<BackendHealth> {
   try {
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 4000);
+    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
     const res = await fetch(`${API_BASE_URL}/health`, {
       signal: controller.signal,
     });
@@ -62,6 +64,7 @@ export async function checkBackendHealth(): Promise<BackendHealth> {
     const data = await res.json();
     return {
       online: true,
+      isWaking: false,
       engine: data.database?.engine || 'postgresql',
       databaseUrl: data.database?.url,
       hindsightBank: data.hindsight?.bank_id || 'novamart-prod-db',
@@ -70,14 +73,18 @@ export async function checkBackendHealth(): Promise<BackendHealth> {
       primaryModel: data.llm?.primary_model || 'openai/gpt-oss-120b',
     };
   } catch (err: any) {
+    const isTimeout = err.name === 'AbortError' || err.message?.includes('timeout') || err.message?.includes('aborted');
     return {
       online: false,
+      isWaking: isTimeout,
       engine: 'offline',
       hindsightBank: 'unavailable',
       hindsightConfigured: false,
       groqConfigured: false,
       primaryModel: 'unavailable',
-      error: err.name === 'AbortError' ? 'Connection timeout' : (err.message || 'FastAPI server unreachable'),
+      error: isTimeout 
+        ? 'Connection timed out (Render container cold start in progress)' 
+        : (err.message || 'FastAPI server unreachable'),
     };
   }
 }
