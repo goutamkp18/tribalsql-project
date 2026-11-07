@@ -150,10 +150,17 @@ export const QueryStudio: React.FC<QueryStudioProps> = ({ initialQuery = '' }) =
               <span>{formatLLMLabel(queryResult.modelUsed).label}</span>
             </div>
           )}
-          <div className="flex items-center gap-1.5 px-3 py-1 rounded-full bg-[#ECFDF5] border border-[#A7F3D0] text-xs font-semibold text-[#16A36A]">
-            <span className="w-2 h-2 rounded-full bg-[#16A36A] animate-pulse" />
-            <span>Memory Guardrails Active</span>
-          </div>
+          {useMemory ? (
+            <div className="flex items-center gap-1.5 px-3 py-1 rounded-full bg-[#ECFDF5] border border-[#A7F3D0] text-xs font-semibold text-[#16A36A]">
+              <span className="w-2 h-2 rounded-full bg-[#16A36A] animate-pulse" />
+              <span>Memory Guardrails Active</span>
+            </div>
+          ) : (
+            <div className="flex items-center gap-1.5 px-3 py-1 rounded-full bg-[#FEF2F2] border border-[#FECDD3] text-xs font-semibold text-[#E5484D]">
+              <span className="w-2 h-2 rounded-full bg-[#E5484D]" />
+              <span>Cold Start (Memory OFF)</span>
+            </div>
+          )}
         </div>
       </div>
 

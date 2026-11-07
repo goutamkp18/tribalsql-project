@@ -308,15 +308,8 @@ def _mock_retrieve_memory_context(question: str) -> Dict[str, Any]:
             "5. Legacy Table Restriction: NEVER query the 'orders_legacy' table; it is deprecated 2024 data."
         )
     else:
-        # Default institutional playbook fallback when offline or credits depleted
-        playbook = (
-            "Active NovaMart SQL Playbook (Synthesized from Hindsight Memory):\n"
-            "1. Premium Customers Definition: DO NOT use outdated 'account_type = premium'. Instead, filter by (c.loyalty_tier = 'GOLD' OR c.lifetime_value >= 50000).\n"
-            "2. Exclude Internal Test Accounts: Always filter out fake QA/test accounts (c.email NOT LIKE '%@novamart-test.com') when computing revenue, order counts, customer rankings, or customer analytics (such as top customers or customers who have never placed an order).\n"
-            "3. Order Status Filtering: Only sum COMPLETED orders (o.status = 'COMPLETED') for revenue calculations. Exclude CANCELLED and PENDING orders.\n"
-            "4. Refund Deductions: Always deduct refunds from orders by joining the refunds table: o.total_amount - COALESCE(r.refund_amount, 0).\n"
-            "5. Legacy Table Restriction: NEVER query the 'orders_legacy' table; it is deprecated 2024 data."
-        )
+        # Cold start / no local memory stored yet
+        playbook = "No historical tribal knowledge or analyst corrections recorded yet for this database."
 
     return {
         "recalled_items": recalled_items,

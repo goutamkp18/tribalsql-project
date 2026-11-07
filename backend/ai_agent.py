@@ -116,7 +116,7 @@ def validate_sql_syntax(sql: str) -> Tuple[bool, Optional[str]]:
 def validate_sql_with_sqlglot(sql: str, active_playbook: str = "", question: str = "") -> None:
     """
     Comprehensive AST safety check: raises ValueError if syntax is invalid
-    or if known schema traps (e.g. orders_legacy, outdated account_type) are triggered.
+    or if non-SELECT / mutating statements are attempted.
     """
     clean_sql = (sql or "").strip()
     if not clean_sql:
@@ -125,35 +125,6 @@ def validate_sql_with_sqlglot(sql: str, active_playbook: str = "", question: str
     is_valid, err = validate_sql_syntax(clean_sql)
     if not is_valid:
         raise ValueError(err)
-
-    parsed = sqlglot.parse_one(clean_sql.rstrip(";"), read="postgres")
-
-    # Schema Trap Check: orders_legacy table (deprecated 2024 table)
-    # Permitted if the user specifically asked for legacy / historical 2024 orders.
-    # Otherwise, raise schema trap violation if queried when regular orders were intended.
-    q_lower = (question or "").lower()
-    is_legacy_explicitly_requested = any(k in q_lower for k in ["legacy", "orders_legacy", "historical", "archive", "2024"])
-
-    if not is_legacy_explicitly_requested:
-        for tbl in parsed.find_all(exp.Table):
-            tname = tbl.name.lower() if tbl.name else ""
-            if tname == "orders_legacy":
-                raise ValueError(
-                    "Schema Trap Violation: 'orders_legacy' is a deprecated 2024 table and must never be queried unless specifically requested. Use 'orders' instead."
-                )
-
-    # Schema Trap Check: customers.account_type used for filtering in WHERE / JOIN ON clauses
-    # The trap is using deprecated account_type = 'premium' instead of loyalty_tier = 'GOLD' or lifetime_value >= 50000
-    for clause_type in (exp.Where, exp.Join):
-        clause = parsed.find(clause_type)
-        if clause:
-            for col in clause.find_all(exp.Column):
-                cname = col.name.lower() if col.name else ""
-                if cname == "account_type":
-                    raise ValueError(
-                        "Schema Trap Violation: 'customers.account_type' is an outdated column. "
-                        "Company rule requires using 'loyalty_tier' = 'GOLD' or 'lifetime_value' >= 50000."
-                    )
 
 
 # -----------------------------------------------------------------------------
@@ -425,23 +396,37 @@ def generate_and_validate_sql(
     # 1. Hindsight Memory Recall
     if use_memory:
         memory_ctx = retrieve_memory_context(question)
+        recalled_items = memory_ctx.get("recalled_items", [])
+        active_playbook = memory_ctx.get("synthesized_playbook", "")
+        recalled_texts = [item.get("text", "") for item in recalled_items if item.get("text")]
+        
+        memory_prompt_block = f"""--- INSTITUTIONAL BUSINESS RULES (Recalled from Hindsight Cloud Memory) ---
+Active Playbook:
+{active_playbook if active_playbook else "No active playbook synthesized."}
+
+Recalled Company Rules & Experiences:
+{json.dumps(recalled_texts, indent=2) if recalled_texts else "[]"}
+
+Carefully apply the relevant institutional business rules above to ensure company policy compliance."""
     else:
         memory_ctx = {
             "recalled_items": [],
             "synthesized_playbook": "Memory recall disabled by request."
         }
-
-    recalled_items = memory_ctx.get("recalled_items", [])
-    active_playbook = memory_ctx.get("synthesized_playbook", "")
+        recalled_items = []
+        active_playbook = ""
+        memory_prompt_block = """--- MODE: COLD START BASELINE (Hindsight Memory OFF) ---
+You are operating in Cold Start Baseline Mode without access to institutional memory, historical corrections, or company business rules.
+Generate standard SQL based solely on the PostgreSQL schema DDL and user question."""
 
     # Structured Memory Inspector payload
     memory_inspector = {
         "bank_id": HINDSIGHT_BANK_ID,
         "query": question,
         "recalled_memories": recalled_items,
-        "synthesized_playbook": active_playbook,
+        "synthesized_playbook": active_playbook or ("Memory recall disabled by request." if not use_memory else ""),
         "recalled_count": len(recalled_items),
-        "cloud_connected": is_hindsight_configured()
+        "cloud_connected": is_hindsight_configured() and use_memory
     }
 
     # 2. Schema DDL Injection
@@ -460,33 +445,17 @@ The ONLY tables that exist in the PostgreSQL database are:
 Detailed Schema Column Definitions:
 {schema_ddl}
 
---- RECALLED COMPANY RULES (From Hindsight Semantic Memory) ---
-- Rule 1 (Premium Customers): When the user specifically asks about 'premium customers' or VIP accounts, define premium as (loyalty_tier = 'GOLD' OR lifetime_value >= 50000). The column 'account_type' is outdated and must not be used for premium filtering.
-- Rule 2 (Test Accounts Exclusion): Exclude internal QA/test accounts (email NOT LIKE '%@novamart-test.com') when:
-  a) Computing revenue, financial metrics, order counts, or business KPIs.
-  b) Performing customer analytics, customer segmentations, customer rankings, or customer activity queries (such as identifying top customers, or identifying customers who have never placed an order).
-  Do NOT exclude test accounts when the user asks for raw unfiltered table dumps (e.g., "Show all customers").
-- Rule 3 (Completed Orders Filter): For revenue calculations, only include orders where status = 'COMPLETED'. Exclude CANCELLED and PENDING orders.
-- Rule 4 (Deduct Refunds): When calculating net revenue, deduct refund amounts using COALESCE(refund_amount, 0).
-- Rule 5 (Legacy Table): 'orders_legacy' is a deprecated 2024 table. When the user asks for standard orders or current revenue, use 'orders'. However, if the user specifically requests 'orders_legacy' or historical/legacy orders, you SHOULD query 'orders_legacy'.
-
---- ACTIVE HINDSIGHT PLAYBOOK CONTEXT ---
-{active_playbook if active_playbook else "No specific human corrections available for this prompt."}
-
---- RECALLED PAST INTERACTIONS & CORRECTIONS ---
-{json.dumps(recalled_items[:5], indent=2) if recalled_items else "[]"}
+{memory_prompt_block}
 
 --- INSTRUCTIONS ---
-1. Dynamic SQL: Answer the user's SPECIFIC question accurately. Do NOT convert every question into a net revenue calculation.
-2. Relevance & Scoping: Apply Hindsight company rules accurately based on query scope:
-   - For revenue calculations, apply completed orders filter, refund deduction, and test-account exclusion.
-   - For customer analytics and customer behavior queries (e.g., "Which customer has the highest lifetime value?", "Which customers have never placed an order?", customer order rankings), always exclude internal test accounts (email NOT LIKE '%@novamart-test.com') so internal QA accounts/bots do not distort customer metrics.
-   - For raw table inspection queries (e.g., "Show all customers", "List all orders"), query the table directly without filtering out records.
+1. Dynamic SQL: Answer the user's SPECIFIC question accurately based on the available schema.
+2. Query Scoping & Intent:
+   - For raw table inspection and direct count queries (e.g., "Show all customers", "List all orders", "Count customers", "Count all customers"), query the table directly without filtering out records (return all raw table records, including test accounts).
+   - For business analytics, financial metrics, customer rankings, and activity analysis (e.g., "Which customer has the highest lifetime value?", "Which customers have never placed an order?", top customer analysis, revenue calculations), apply Hindsight institutional rules (exclude internal test accounts where email LIKE '%@novamart-test.com').
 3. Schema Accuracy & Strict Boundaries: Never hallucinate or assume tables/columns not in the schema. Tables like 'products', 'inventory', 'categories', 'suppliers', 'reviews', 'shipping', 'customer_segments' DO NOT EXIST.
    - If a question asks for entities, tables, or attributes that do not exist in the database (such as products, inventory, items), you MUST set "sql": "" (empty string) and explain in "explanation" which tables/columns are missing from NovaMart's schema.
 4. Safe SELECT Only: Only generate read-only SELECT queries. Mutating operations (DROP, INSERT, UPDATE, DELETE, ALTER) are strictly forbidden.
-5. Explicit Legacy Table Request: If the user specifically asks for 'orders_legacy' or legacy/historical orders, generate a SELECT query for 'orders_legacy'. Do not refuse to query it when explicitly asked.
-6. You MUST return your response as a valid JSON object matching this schema:
+5. You MUST return your response as a valid JSON object matching this schema:
 {{
   "sql": "SELECT ...;",
   "explanation": "Clear explanation of how the query answers the user question or why a table is missing...",
