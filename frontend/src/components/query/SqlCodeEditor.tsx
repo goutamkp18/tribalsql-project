@@ -15,14 +15,20 @@ interface SqlCodeEditorProps {
 export function formatLLMLabel(model?: string): { label: string; isFallback: boolean } {
   if (!model) return { label: 'LLM: Groq', isFallback: false };
   const m = model.toLowerCase();
-  if (m.includes('gpt-oss-120b')) {
-    return { label: 'LLM: GPT OSS 120B', isFallback: false };
+  if (m.includes('rate-limited') || m.includes('unavailable')) {
+    return { label: 'LLM: Service Rate-Limited', isFallback: true };
+  }
+  if (m.includes('offline-heuristic')) {
+    return { label: 'Offline Heuristic Agent', isFallback: true };
+  }
+  if (m.includes('gpt-oss-120b') && !m.includes('fallback')) {
+    return { label: 'LLM: GPT OSS 120B (Primary)', isFallback: false };
   }
   if (m.includes('gpt-oss-20b')) {
     return { label: 'LLM: GPT OSS 20B (Fallback)', isFallback: true };
   }
   if (m.includes('qwen')) {
-    return { label: 'LLM: Qwen (Fallback)', isFallback: true };
+    return { label: 'LLM: Qwen (Deprecated)', isFallback: true };
   }
   return { label: `LLM: ${model}`, isFallback: false };
 }

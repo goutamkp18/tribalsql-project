@@ -50,7 +50,8 @@ from ai_agent import (
     generate_and_validate_sql,
     validate_sql_with_sqlglot,
     is_groq_configured,
-    GROQ_PRIMARY_MODEL
+    GROQ_PRIMARY_MODEL,
+    GROQ_FALLBACK_MODEL
 )
 
 logger = logging.getLogger("tribalsql.api")
@@ -168,7 +169,8 @@ def health_check():
         },
         "llm": {
             "groq_configured": is_groq_configured(),
-            "primary_model": os.getenv("GROQ_PRIMARY_MODEL", GROQ_PRIMARY_MODEL)
+            "primary_model": os.getenv("GROQ_PRIMARY_MODEL", GROQ_PRIMARY_MODEL),
+            "fallback_model": os.getenv("GROQ_FALLBACK_MODEL", GROQ_FALLBACK_MODEL)
         }
     }
 

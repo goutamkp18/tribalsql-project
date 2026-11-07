@@ -12,7 +12,7 @@ import { presetQueries } from '../data/mockQueryStudio';
 import { useToast } from '../components/common/ToastContext';
 import { Badge } from '../components/common/Badge';
 import { getApiMode } from '../services/api';
-import { Code2, BrainCircuit } from 'lucide-react';
+import { Code2, BrainCircuit, AlertTriangle } from 'lucide-react';
 
 interface QueryStudioProps {
   initialQuery?: string;
@@ -184,6 +184,16 @@ export const QueryStudio: React.FC<QueryStudioProps> = ({ initialQuery = '' }) =
       {/* Query Results & Execution Workspace */}
       {queryResult && (
         <div className="space-y-6">
+          {queryResult.error && (
+            <div className="rounded-2xl bg-[#FEF2F2] border border-[#FECDD3] p-4 text-xs text-[#991B1B] flex items-start gap-3 shadow-2xs">
+              <AlertTriangle className="w-4 h-4 text-[#E5484D] shrink-0 mt-0.5" />
+              <div>
+                <p className="font-bold text-[#E5484D]">Temporary Service Notice</p>
+                <p className="mt-0.5 text-[#7F1D1D] leading-relaxed">{queryResult.error}</p>
+              </div>
+            </div>
+          )}
+
           {/* Recalled Hindsight Memories Banner */}
           <MemoryRecallBanner
             recalledMemories={queryResult.recalledMemories}

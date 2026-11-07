@@ -46,8 +46,28 @@ logger = logging.getLogger("tribalsql.ai_agent")
 logging.basicConfig(level=logging.INFO)
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
-GROQ_PRIMARY_MODEL = os.getenv("GROQ_PRIMARY_MODEL", "openai/gpt-oss-120b")
-GROQ_FALLBACK_MODEL = os.getenv("GROQ_FALLBACK_MODEL", "openai/gpt-oss-20b")
+
+def _sanitize_model_name(model_name: Optional[str], default_model: str) -> str:
+    """Sanitizes model name to ensure deprecated/invalid models like qwen are replaced."""
+    if not model_name:
+        return default_model
+    cleaned = str(model_name).strip().strip('"').strip("'")
+    if not cleaned or "qwen" in cleaned.lower() or cleaned.lower() == "none":
+        logger.warning(f"Deprecated or invalid model '{model_name}' detected. Overriding with '{default_model}'.")
+        return default_model
+    return cleaned
+
+GROQ_PRIMARY_MODEL = _sanitize_model_name(os.getenv("GROQ_PRIMARY_MODEL"), "openai/gpt-oss-120b")
+GROQ_FALLBACK_MODEL = _sanitize_model_name(os.getenv("GROQ_FALLBACK_MODEL"), "openai/gpt-oss-20b")
+
+
+class GroqServiceUnavailableError(Exception):
+    """Raised when both Groq primary and fallback models fail (e.g. rate limits or downtime)."""
+    def __init__(self, message: str, primary_model: str, fallback_model: str, last_error: str):
+        super().__init__(message)
+        self.primary_model = primary_model
+        self.fallback_model = fallback_model
+        self.last_error = last_error
 
 
 class SQLAgentResponse(BaseModel):
@@ -63,10 +83,11 @@ def is_groq_configured() -> bool:
 
 
 def get_groq_client():
-    """Instantiate Groq SDK client."""
+    """Instantiate Groq SDK client with max_retries=0 so 429 rate limits trigger immediate fallback."""
     from groq import Groq
     key = os.getenv("GROQ_API_KEY", GROQ_API_KEY)
-    return Groq(api_key=key)
+    # Set max_retries=0 to avoid waiting/retrying repeatedly on rate-limited/exhausted models
+    return Groq(api_key=key, max_retries=0)
 
 
 # -----------------------------------------------------------------------------
@@ -181,12 +202,15 @@ def _call_groq_llm(
 ) -> Tuple[str, str, List[str], str]:
     """
     Calls Groq API with configured primary model (openai/gpt-oss-120b) and
-    automatic fallback to secondary model (openai/gpt-oss-20b) upon error.
+    immediate fallback to secondary model (openai/gpt-oss-20b) upon error or rate limit.
     Returns: (sql, explanation, applied_rules, model_used)
     """
     client = get_groq_client()
-    primary = model_override or os.getenv("GROQ_PRIMARY_MODEL", GROQ_PRIMARY_MODEL)
-    fallback = os.getenv("GROQ_FALLBACK_MODEL", GROQ_FALLBACK_MODEL)
+    raw_primary = model_override or os.getenv("GROQ_PRIMARY_MODEL", GROQ_PRIMARY_MODEL)
+    raw_fallback = os.getenv("GROQ_FALLBACK_MODEL", GROQ_FALLBACK_MODEL)
+
+    primary = _sanitize_model_name(raw_primary, "openai/gpt-oss-120b")
+    fallback = _sanitize_model_name(raw_fallback, "openai/gpt-oss-20b")
 
     candidate_models: List[str] = []
     if primary:
@@ -208,10 +232,16 @@ def _call_groq_llm(
             sql, explanation, rules = _extract_sql_from_text(content)
             return sql, explanation, rules, model
         except Exception as e:
-            errors.append(f"{model}: {e}")
-            logger.warning(f"Groq model '{model}' failed: {e}")
+            err_str = str(e)
+            errors.append(f"{model}: {err_str}")
+            logger.warning(f"Groq model '{model}' failed (rate limit/error): {err_str}")
 
-    raise RuntimeError(f"Both Groq LLM models failed. Primary ({primary}) and Fallback ({fallback}) errors: {'; '.join(errors)}")
+    raise GroqServiceUnavailableError(
+        f"Both Groq LLM models failed. Primary ({primary}) and Fallback ({fallback}) errors: {'; '.join(errors)}",
+        primary_model=primary,
+        fallback_model=fallback,
+        last_error="; ".join(errors)
+    )
 
 
 # -----------------------------------------------------------------------------
@@ -472,7 +502,7 @@ Detailed Schema Column Definitions:
     candidate_sql = ""
     explanation = ""
     applied_rules: List[str] = []
-    model_used = "offline-heuristic-agent"
+    model_used = "openai/gpt-oss-120b" if is_groq_configured() else "offline-heuristic-agent"
     sqlglot_valid = False
     exec_result: Dict[str, Any] = {"rows": [], "row_count": 0, "execution_time_ms": 0.0}
     last_error: Optional[str] = None
@@ -482,7 +512,37 @@ Detailed Schema Column Definitions:
         try:
             # Step A: Generate SQL from Groq or Heuristic Fallback
             if is_groq_configured():
-                candidate_sql, explanation, applied_rules, model_used = _call_groq_llm(messages, model_override=model_override)
+                try:
+                    candidate_sql, explanation, applied_rules, model_used = _call_groq_llm(messages, model_override=model_override)
+                except GroqServiceUnavailableError as llm_err:
+                    # Immediately exit upon rate limit / quota exhaustion across both models.
+                    # Do not loop 3 times and do not disguise as offline heuristic agent!
+                    logger.error(f"Groq service unavailable: {llm_err}")
+                    return {
+                        "sql": "",
+                        "sqlglot_valid": False,
+                        "results": [],
+                        "memory_inspector": memory_inspector,
+                        "explanation": (
+                            "Groq LLM service is temporarily unavailable due to upstream rate limits or quota exhaustion "
+                            f"on both primary ({llm_err.primary_model}) and fallback ({llm_err.fallback_model}) models. "
+                            "Please wait a few moments before submitting another query."
+                        ),
+                        "applied_rules": ["Notice: Upstream Groq LLM rate limit encountered on all configured models"],
+                        "memory_context": memory_inspector,
+                        "execution_time_ms": 0.0,
+                        "row_count": 0,
+                        "engine": get_active_engine(),
+                        "attempts": 1,
+                        "self_healed": False,
+                        "model_used": f"{llm_err.primary_model} (rate-limited) / {llm_err.fallback_model} (unavailable)",
+                        "preview_result": {"columns": [], "rows": [], "row_count": 0, "execution_time_ms": 0.0},
+                        "use_memory": use_memory,
+                        "error": (
+                            f"Upstream Groq LLM rate limit or quota exceeded. "
+                            f"Attempted: {llm_err.primary_model} and {llm_err.fallback_model}. Details: {llm_err.last_error}"
+                        )
+                    }
             else:
                 heuristic_resp = _heuristic_generate(question, use_memory, memory_ctx)
                 candidate_sql = heuristic_resp.sql
