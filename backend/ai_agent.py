@@ -31,7 +31,7 @@ if env_path.exists():
 else:
     load_dotenv()
 
-from db import get_schema_ddl, execute_readonly_sql
+from db import get_schema_ddl, execute_readonly_sql, get_active_engine
 from memory import (
     retrieve_memory_context,
     retain_sql_error,
@@ -46,8 +46,8 @@ logger = logging.getLogger("tribalsql.ai_agent")
 logging.basicConfig(level=logging.INFO)
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
-GROQ_PRIMARY_MODEL = os.getenv("GROQ_PRIMARY_MODEL", "qwen/qwen3-32b")
-GROQ_FALLBACK_MODEL = os.getenv("GROQ_FALLBACK_MODEL", "openai/gpt-oss-120b")
+GROQ_PRIMARY_MODEL = os.getenv("GROQ_PRIMARY_MODEL", "openai/gpt-oss-120b")
+GROQ_FALLBACK_MODEL = os.getenv("GROQ_FALLBACK_MODEL", "openai/gpt-oss-20b")
 
 
 class SQLAgentResponse(BaseModel):
@@ -113,34 +113,47 @@ def validate_sql_syntax(sql: str) -> Tuple[bool, Optional[str]]:
     return True, None
 
 
-def validate_sql_with_sqlglot(sql: str, active_playbook: str = "") -> None:
+def validate_sql_with_sqlglot(sql: str, active_playbook: str = "", question: str = "") -> None:
     """
     Comprehensive AST safety check: raises ValueError if syntax is invalid
     or if known schema traps (e.g. orders_legacy, outdated account_type) are triggered.
     """
-    is_valid, err = validate_sql_syntax(sql)
+    clean_sql = (sql or "").strip()
+    if not clean_sql:
+        return
+
+    is_valid, err = validate_sql_syntax(clean_sql)
     if not is_valid:
         raise ValueError(err)
 
-    parsed = sqlglot.parse_one(sql.strip().rstrip(";"), read="postgres")
+    parsed = sqlglot.parse_one(clean_sql.rstrip(";"), read="postgres")
 
     # Schema Trap Check: orders_legacy table (deprecated 2024 table)
-    for tbl in parsed.find_all(exp.Table):
-        tname = tbl.name.lower() if tbl.name else ""
-        if tname == "orders_legacy":
-            raise ValueError(
-                "Schema Trap Violation: 'orders_legacy' is a deprecated 2024 table and must never be queried. Use 'orders' instead."
-            )
+    # Permitted if the user specifically asked for legacy / historical 2024 orders.
+    # Otherwise, raise schema trap violation if queried when regular orders were intended.
+    q_lower = (question or "").lower()
+    is_legacy_explicitly_requested = any(k in q_lower for k in ["legacy", "orders_legacy", "historical", "archive", "2024"])
 
-    # Schema Trap Check: customers.account_type column
-    if "account_type" in active_playbook.lower():
-        for col in parsed.find_all(exp.Column):
-            cname = col.name.lower() if col.name else ""
-            if cname == "account_type":
+    if not is_legacy_explicitly_requested:
+        for tbl in parsed.find_all(exp.Table):
+            tname = tbl.name.lower() if tbl.name else ""
+            if tname == "orders_legacy":
                 raise ValueError(
-                    "Schema Trap Violation: 'customers.account_type' is an outdated column. "
-                    "Company rule requires using 'loyalty_tier' = 'GOLD' or 'lifetime_value' >= 50000."
+                    "Schema Trap Violation: 'orders_legacy' is a deprecated 2024 table and must never be queried unless specifically requested. Use 'orders' instead."
                 )
+
+    # Schema Trap Check: customers.account_type used for filtering in WHERE / JOIN ON clauses
+    # The trap is using deprecated account_type = 'premium' instead of loyalty_tier = 'GOLD' or lifetime_value >= 50000
+    for clause_type in (exp.Where, exp.Join):
+        clause = parsed.find(clause_type)
+        if clause:
+            for col in clause.find_all(exp.Column):
+                cname = col.name.lower() if col.name else ""
+                if cname == "account_type":
+                    raise ValueError(
+                        "Schema Trap Violation: 'customers.account_type' is an outdated column. "
+                        "Company rule requires using 'loyalty_tier' = 'GOLD' or 'lifetime_value' >= 50000."
+                    )
 
 
 # -----------------------------------------------------------------------------
@@ -196,58 +209,38 @@ def _call_groq_llm(
     model_override: Optional[str] = None
 ) -> Tuple[str, str, List[str], str]:
     """
-    Calls Groq API with model `qwen/qwen3-32b` and automatic fallback to `openai/gpt-oss-120b`.
+    Calls Groq API with configured primary model (openai/gpt-oss-120b) and
+    automatic fallback to secondary model (openai/gpt-oss-20b) upon error.
     Returns: (sql, explanation, applied_rules, model_used)
     """
     client = get_groq_client()
     primary = model_override or os.getenv("GROQ_PRIMARY_MODEL", GROQ_PRIMARY_MODEL)
     fallback = os.getenv("GROQ_FALLBACK_MODEL", GROQ_FALLBACK_MODEL)
-    primary_err = None
-    fallback_err = None
 
-    # Try Primary Model
-    try:
-        logger.info(f"Calling Groq LLM with primary model: {primary}")
-        completion = client.chat.completions.create(
-            model=primary,
-            messages=messages,
-            response_format={"type": "json_object"},
-            temperature=0.0
-        )
-        content = completion.choices[0].message.content
-        sql, explanation, rules = _extract_sql_from_text(content)
-        return sql, explanation, rules, primary
-    except Exception as e_primary:
-        primary_err = str(e_primary)
-        logger.warning(f"Groq primary model '{primary}' failed ({e_primary}). Invoking fallback '{fallback}'...")
+    candidate_models: List[str] = []
+    if primary:
+        candidate_models.append(primary)
+    if fallback and fallback not in candidate_models:
+        candidate_models.append(fallback)
 
-    # Try Fallback Model
-    try:
-        completion = client.chat.completions.create(
-            model=fallback,
-            messages=messages,
-            response_format={"type": "json_object"},
-            temperature=0.0
-        )
-        content = completion.choices[0].message.content
-        sql, explanation, rules = _extract_sql_from_text(content)
-        return sql, explanation, rules, fallback
-    except Exception as e_fallback:
-        fallback_err = str(e_fallback)
-        logger.warning(f"Groq fallback model '{fallback}' failed ({e_fallback}). Trying standard resilient fallback...")
-        last_resort = "llama-3.3-70b-versatile"
+    errors = []
+    for model in candidate_models:
         try:
+            logger.info(f"Calling Groq LLM with model: {model}")
             completion = client.chat.completions.create(
-                model=last_resort,
+                model=model,
                 messages=messages,
                 response_format={"type": "json_object"},
                 temperature=0.0
             )
             content = completion.choices[0].message.content
             sql, explanation, rules = _extract_sql_from_text(content)
-            return sql, explanation, rules, last_resort
-        except Exception as e_final:
-            raise RuntimeError(f"All Groq LLM models failed. Primary error: {primary_err}; Fallback error: {fallback_err}; Final error: {e_final}")
+            return sql, explanation, rules, model
+        except Exception as e:
+            errors.append(f"{model}: {e}")
+            logger.warning(f"Groq model '{model}' failed: {e}")
+
+    raise RuntimeError(f"Both Groq LLM models failed. Primary ({primary}) and Fallback ({fallback}) errors: {'; '.join(errors)}")
 
 
 # -----------------------------------------------------------------------------
@@ -257,45 +250,152 @@ def _call_groq_llm(
 def _heuristic_generate(question: str, use_memory: bool, memory_ctx: Dict[str, Any]) -> SQLAgentResponse:
     """
     Deterministic simulation when running offline without Groq API key,
-    accurately reflecting Cold Start vs Learned Memory states.
+    supporting varied user questions, schema boundary enforcement,
+    and accurately reflecting Cold Start vs Learned Memory states.
     """
+    q_lower = (question or "").lower().strip()
     has_rules = bool(memory_ctx.get("recalled_items") and len(memory_ctx["recalled_items"]) > 0)
 
-    if not use_memory or not has_rules:
+    # 1. Schema boundary check: non-existent tables (products, inventory, suppliers, categories)
+    if any(k in q_lower for k in ["product", "item", "inventory", "category", "categories", "supplier"]):
         return SQLAgentResponse(
-            sql="SELECT SUM(total_amount) AS net_revenue FROM orders o JOIN customers c ON o.customer_id = c.id WHERE c.account_type = 'premium';",
-            explanation="Cold Start (Schema Only): Filtered by outdated 'account_type = premium' without company rules.",
-            applied_rules=["None (Cold Start - Baseline schema only)"]
+            sql="",
+            explanation="The NovaMart database schema does not contain a 'products', 'inventory', or 'categories' table. Available tables are customers, orders, refunds, and orders_legacy.",
+            applied_rules=["Schema Boundary: missing table / column requested"]
         )
-    else:
+
+    # 2. Benchmark Query: "Calculate net revenue from premium customers..."
+    if "premium" in q_lower and "revenue" in q_lower:
+        if not use_memory or not has_rules:
+            return SQLAgentResponse(
+                sql="SELECT SUM(total_amount) AS net_revenue FROM orders o JOIN customers c ON o.customer_id = c.id WHERE c.account_type = 'premium';",
+                explanation="Cold Start (Schema Only): Filtered by outdated 'account_type = premium' without company rules.",
+                applied_rules=["None (Cold Start - Baseline schema only)"]
+            )
+        else:
+            return SQLAgentResponse(
+                sql=(
+                    "SELECT COALESCE(SUM(o.total_amount - COALESCE(r.refund_amount, 0)), 0) AS net_revenue "
+                    "FROM orders o "
+                    "JOIN customers c ON o.customer_id = c.id "
+                    "LEFT JOIN ("
+                    "    SELECT order_id, SUM(refund_amount) AS refund_amount "
+                    "    FROM refunds "
+                    "    GROUP BY order_id"
+                    ") r ON o.id = r.order_id "
+                    "WHERE (c.loyalty_tier = 'GOLD' OR c.lifetime_value >= 50000) "
+                    "  AND c.email NOT LIKE '%@novamart-test.com' "
+                    "  AND o.status = 'COMPLETED';"
+                ),
+                explanation=(
+                    "Learned State (Hindsight Memory Applied): Incorporated active NovaMart tribal playbook. "
+                    "Defined premium by loyalty_tier = 'GOLD' or LTV >= 50,000 (avoided deprecated account_type), "
+                    "excluded test accounts (%@novamart-test.com), filtered for COMPLETED orders, deducted refunds, "
+                    "and bypassed deprecated orders_legacy table."
+                ),
+                applied_rules=[
+                    "Rule 1: Premium Customers = loyalty_tier 'GOLD' or LTV >= $50,000",
+                    "Rule 2: Exclude QA Test Accounts (email NOT LIKE '%@novamart-test.com')",
+                    "Rule 3: Only count COMPLETED orders",
+                    "Rule 4: Deduct refunds to compute true net revenue",
+                    "Rule 5: Deprecated orders_legacy table ignored"
+                ]
+            )
+
+    # 3. Gold loyalty-tier customers
+    if "gold" in q_lower and "customer" in q_lower:
         return SQLAgentResponse(
-            sql=(
-                "SELECT COALESCE(SUM(o.total_amount - COALESCE(r.refund_amount, 0)), 0) AS net_revenue "
-                "FROM orders o "
-                "JOIN customers c ON o.customer_id = c.id "
-                "LEFT JOIN ("
-                "    SELECT order_id, SUM(refund_amount) AS refund_amount "
-                "    FROM refunds "
-                "    GROUP BY order_id"
-                ") r ON o.id = r.order_id "
-                "WHERE (c.loyalty_tier = 'GOLD' OR c.lifetime_value >= 50000) "
-                "  AND c.email NOT LIKE '%@novamart-test.com' "
-                "  AND o.status = 'COMPLETED';"
-            ),
-            explanation=(
-                "Learned State (Hindsight Memory Applied): Incorporated active NovaMart tribal playbook. "
-                "Defined premium by loyalty_tier = 'GOLD' or LTV >= 50,000 (avoided deprecated account_type), "
-                "excluded test accounts (%@novamart-test.com), filtered for COMPLETED orders, deducted refunds, "
-                "and bypassed deprecated orders_legacy table."
-            ),
-            applied_rules=[
-                "Rule 1: Premium Customers = loyalty_tier 'GOLD' or LTV >= $50,000 (outdated account_type bypassed)",
-                "Rule 2: Exclude QA Test Accounts (email NOT LIKE '%@novamart-test.com')",
-                "Rule 3: Only count COMPLETED orders (exclude CANCELLED and PENDING)",
-                "Rule 4: Deduct refunds to compute true net revenue",
-                "Rule 5: Deprecated orders_legacy table ignored"
-            ]
+            sql="SELECT id, name, city, account_type, loyalty_tier, lifetime_value, email FROM customers WHERE loyalty_tier = 'GOLD';",
+            explanation="Returns all customers who hold GOLD loyalty tier status.",
+            applied_rules=["Filter: loyalty_tier = 'GOLD'"]
         )
+
+    # 4. Highest lifetime value
+    if "highest" in q_lower and ("lifetime" in q_lower or "ltv" in q_lower or "value" in q_lower):
+        return SQLAgentResponse(
+            sql="SELECT name, lifetime_value FROM customers ORDER BY lifetime_value DESC LIMIT 1;",
+            explanation="Returns the customer with the highest lifetime value.",
+            applied_rules=["Ranking: ORDER BY lifetime_value DESC LIMIT 1"]
+        )
+
+    # 5. Count customers
+    if ("how many" in q_lower or "count" in q_lower) and "customer" in q_lower:
+        return SQLAgentResponse(
+            sql="SELECT COUNT(*) AS customer_count FROM customers;",
+            explanation="Counts total registered customer records.",
+            applied_rules=["Aggregation: COUNT"]
+        )
+
+    # 6. Customers who have never placed an order
+    if "never" in q_lower and "order" in q_lower:
+        return SQLAgentResponse(
+            sql="SELECT c.id, c.name, c.city, c.loyalty_tier, c.lifetime_value, c.email FROM customers c WHERE c.email NOT LIKE '%@novamart-test.com' AND NOT EXISTS (SELECT 1 FROM orders o WHERE o.customer_id = c.id);",
+            explanation="Identifies genuine customers who have no records in the orders table, excluding internal QA test accounts.",
+            applied_rules=["Anti-join / NOT EXISTS check", "Exclude test accounts"]
+        )
+
+    # 7. Customers with most orders
+    if "most orders" in q_lower:
+        return SQLAgentResponse(
+            sql="SELECT c.id, c.name, COUNT(o.id) AS order_count FROM customers c JOIN orders o ON c.id = o.customer_id WHERE c.email NOT LIKE '%@novamart-test.com' GROUP BY c.id, c.name ORDER BY order_count DESC;",
+            explanation="Aggregates and ranks non-test customers by order count.",
+            applied_rules=["Group by customer_id", "Rank by order_count DESC", "Exclude test accounts"]
+        )
+
+    # 8. All customers
+    if "customer" in q_lower and any(w in q_lower for w in ["all", "show", "list"]):
+        return SQLAgentResponse(
+            sql="SELECT * FROM customers;",
+            explanation="Retrieves all customer records from the customers table.",
+            applied_rules=["Read-only schema access: customers"]
+        )
+
+    # 9. Legacy orders
+    if "legacy" in q_lower or "orders_legacy" in q_lower:
+        return SQLAgentResponse(
+            sql="SELECT * FROM orders_legacy;",
+            explanation="Retrieves archived records from the orders_legacy table.",
+            applied_rules=["Table: orders_legacy"]
+        )
+
+    # 10. Completed orders count
+    if "completed" in q_lower and "order" in q_lower and any(w in q_lower for w in ["how many", "count"]):
+        return SQLAgentResponse(
+            sql="SELECT COUNT(*) AS completed_orders_count FROM orders WHERE status = 'COMPLETED';",
+            explanation="Counts orders with status 'COMPLETED'.",
+            applied_rules=["Filter: status = 'COMPLETED'"]
+        )
+
+    # 11. Total revenue from completed orders
+    if "revenue" in q_lower and "completed" in q_lower:
+        return SQLAgentResponse(
+            sql="SELECT SUM(o.total_amount) AS total_revenue FROM orders o WHERE o.status = 'COMPLETED' AND o.customer_id IN (SELECT c.id FROM customers c WHERE c.email NOT LIKE '%@novamart-test.com');",
+            explanation="Calculates sum of completed orders excluding test accounts.",
+            applied_rules=["Filter: status = 'COMPLETED'", "Exclude test accounts"]
+        )
+
+    # 12. List all orders
+    if "order" in q_lower and any(w in q_lower for w in ["all", "show", "list"]):
+        return SQLAgentResponse(
+            sql="SELECT * FROM orders;",
+            explanation="Retrieves all records from the orders table.",
+            applied_rules=["Table: orders"]
+        )
+
+    # 13. Refund details
+    if "refund" in q_lower:
+        return SQLAgentResponse(
+            sql="SELECT r.id, r.order_id, r.refund_amount, r.reason, o.customer_id, o.total_amount, o.status, o.created_at FROM refunds r JOIN orders o ON r.order_id = o.id;",
+            explanation="Returns refund records joined with corresponding orders.",
+            applied_rules=["Join refunds and orders"]
+        )
+
+    # Default fallback
+    return SQLAgentResponse(
+        sql="SELECT * FROM customers LIMIT 10;",
+        explanation=f"Generated basic customer query for '{question}'.",
+        applied_rules=["Default schema query"]
+    )
 
 
 # -----------------------------------------------------------------------------
@@ -305,7 +405,8 @@ def _heuristic_generate(question: str, use_memory: bool, memory_ctx: Dict[str, A
 def generate_and_validate_sql(
     question: str,
     use_memory: bool = True,
-    max_retries: int = 3
+    max_retries: int = 3,
+    model_override: Optional[str] = None
 ) -> Dict[str, Any]:
     """
     Main Text-to-SQL logic:
@@ -350,22 +451,46 @@ def generate_and_validate_sql(
 Translate the user's natural language question into an accurate, safe PostgreSQL query.
 
 --- DATABASE SCHEMA (PostgreSQL) ---
+The ONLY tables that exist in the PostgreSQL database are:
+1. customers (id, name, city, account_type, loyalty_tier, lifetime_value, email)
+2. orders (id, customer_id, total_amount, status, created_at)
+3. refunds (id, order_id, refund_amount, reason)
+4. orders_legacy (id, customer_id, amount)
+
+Detailed Schema Column Definitions:
 {schema_ddl}
 
---- RECALLED COMPANY RULES & PLAYBOOK (From Hindsight Semantic Memory) ---
-{active_playbook if active_playbook else "No past human corrections or company tribal knowledge available."}
+--- RECALLED COMPANY RULES (From Hindsight Semantic Memory) ---
+- Rule 1 (Premium Customers): When the user specifically asks about 'premium customers' or VIP accounts, define premium as (loyalty_tier = 'GOLD' OR lifetime_value >= 50000). The column 'account_type' is outdated and must not be used for premium filtering.
+- Rule 2 (Test Accounts Exclusion): Exclude internal QA/test accounts (email NOT LIKE '%@novamart-test.com') when:
+  a) Computing revenue, financial metrics, order counts, or business KPIs.
+  b) Performing customer analytics, customer segmentations, customer rankings, or customer activity queries (such as identifying top customers, or identifying customers who have never placed an order).
+  Do NOT exclude test accounts when the user asks for raw unfiltered table dumps (e.g., "Show all customers").
+- Rule 3 (Completed Orders Filter): For revenue calculations, only include orders where status = 'COMPLETED'. Exclude CANCELLED and PENDING orders.
+- Rule 4 (Deduct Refunds): When calculating net revenue, deduct refund amounts using COALESCE(refund_amount, 0).
+- Rule 5 (Legacy Table): 'orders_legacy' is a deprecated 2024 table. When the user asks for standard orders or current revenue, use 'orders'. However, if the user specifically requests 'orders_legacy' or historical/legacy orders, you SHOULD query 'orders_legacy'.
+
+--- ACTIVE HINDSIGHT PLAYBOOK CONTEXT ---
+{active_playbook if active_playbook else "No specific human corrections available for this prompt."}
 
 --- RECALLED PAST INTERACTIONS & CORRECTIONS ---
-{json.dumps(recalled_items, indent=2) if recalled_items else "[]"}
+{json.dumps(recalled_items[:5], indent=2) if recalled_items else "[]"}
 
 --- INSTRUCTIONS ---
-1. If company rules, KPI definitions, or past analyst corrections are provided in the Hindsight memory section above, you MUST strictly follow them.
-2. Only generate read-only SELECT queries. Mutating operations (DROP, INSERT, UPDATE, DELETE) are strictly forbidden.
-3. You MUST return your response as a valid JSON object matching this schema:
+1. Dynamic SQL: Answer the user's SPECIFIC question accurately. Do NOT convert every question into a net revenue calculation.
+2. Relevance & Scoping: Apply Hindsight company rules accurately based on query scope:
+   - For revenue calculations, apply completed orders filter, refund deduction, and test-account exclusion.
+   - For customer analytics and customer behavior queries (e.g., "Which customer has the highest lifetime value?", "Which customers have never placed an order?", customer order rankings), always exclude internal test accounts (email NOT LIKE '%@novamart-test.com') so internal QA accounts/bots do not distort customer metrics.
+   - For raw table inspection queries (e.g., "Show all customers", "List all orders"), query the table directly without filtering out records.
+3. Schema Accuracy & Strict Boundaries: Never hallucinate or assume tables/columns not in the schema. Tables like 'products', 'inventory', 'categories', 'suppliers', 'reviews', 'shipping', 'customer_segments' DO NOT EXIST.
+   - If a question asks for entities, tables, or attributes that do not exist in the database (such as products, inventory, items), you MUST set "sql": "" (empty string) and explain in "explanation" which tables/columns are missing from NovaMart's schema.
+4. Safe SELECT Only: Only generate read-only SELECT queries. Mutating operations (DROP, INSERT, UPDATE, DELETE, ALTER) are strictly forbidden.
+5. Explicit Legacy Table Request: If the user specifically asks for 'orders_legacy' or legacy/historical orders, generate a SELECT query for 'orders_legacy'. Do not refuse to query it when explicitly asked.
+6. You MUST return your response as a valid JSON object matching this schema:
 {{
-  "sql": "SELECT ...",
-  "explanation": "Step-by-step reasoning...",
-  "applied_rules": ["Rule 1", "Rule 2"]
+  "sql": "SELECT ...;",
+  "explanation": "Clear explanation of how the query answers the user question or why a table is missing...",
+  "applied_rules": ["Rule applied..."]
 }}
 """
 
@@ -388,15 +513,7 @@ Translate the user's natural language question into an accurate, safe PostgreSQL
         try:
             # Step A: Generate SQL from Groq or Heuristic Fallback
             if is_groq_configured():
-                try:
-                    candidate_sql, explanation, applied_rules, model_used = _call_groq_llm(messages)
-                except Exception as e_groq:
-                    logger.warning(f"Groq API call failed ({e_groq}). Falling back to local agent simulation.")
-                    heuristic_resp = _heuristic_generate(question, use_memory, memory_ctx)
-                    candidate_sql = heuristic_resp.sql
-                    explanation = heuristic_resp.explanation
-                    applied_rules = heuristic_resp.applied_rules
-                    model_used = "offline-heuristic-agent"
+                candidate_sql, explanation, applied_rules, model_used = _call_groq_llm(messages, model_override=model_override)
             else:
                 heuristic_resp = _heuristic_generate(question, use_memory, memory_ctx)
                 candidate_sql = heuristic_resp.sql
@@ -404,13 +521,33 @@ Translate the user's natural language question into an accurate, safe PostgreSQL
                 applied_rules = heuristic_resp.applied_rules
                 model_used = "offline-heuristic-agent"
 
+            # If candidate_sql is empty (schema boundary: entity not in database)
+            if not candidate_sql.strip():
+                return {
+                    "sql": "",
+                    "sqlglot_valid": True,
+                    "results": [],
+                    "memory_inspector": memory_inspector,
+                    "explanation": explanation or "The requested entities or attributes do not exist in the NovaMart database schema.",
+                    "applied_rules": applied_rules or ["Schema Boundary: Missing schema entity requested"],
+                    "memory_context": memory_inspector,
+                    "execution_time_ms": 0.0,
+                    "row_count": 0,
+                    "engine": get_active_engine(),
+                    "attempts": attempts,
+                    "self_healed": False,
+                    "model_used": model_used,
+                    "preview_result": {"columns": [], "rows": [], "row_count": 0, "execution_time_ms": 0.0},
+                    "use_memory": use_memory
+                }
+
             # Step B: SQLGlot Validation
             sqlglot_valid, syntax_error = validate_sql_syntax(candidate_sql)
             if not sqlglot_valid:
                 raise ValueError(f"SQLGlot validation failed: {syntax_error}")
 
             # Also verify schema traps (orders_legacy, outdated columns)
-            validate_sql_with_sqlglot(candidate_sql, active_playbook)
+            validate_sql_with_sqlglot(candidate_sql, active_playbook, question=question)
 
             # Step C: Execution against Database (PostgreSQL/Supabase or SQLite)
             exec_result = execute_readonly_sql(candidate_sql)

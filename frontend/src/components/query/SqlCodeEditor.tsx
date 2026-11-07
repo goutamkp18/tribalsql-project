@@ -9,6 +9,22 @@ interface SqlCodeEditorProps {
   onExplain: () => void;
   onOpenCorrection: () => void;
   isExecuting?: boolean;
+  modelUsed?: string;
+}
+
+export function formatLLMLabel(model?: string): { label: string; isFallback: boolean } {
+  if (!model) return { label: 'LLM: Groq', isFallback: false };
+  const m = model.toLowerCase();
+  if (m.includes('gpt-oss-120b')) {
+    return { label: 'LLM: GPT OSS 120B', isFallback: false };
+  }
+  if (m.includes('gpt-oss-20b')) {
+    return { label: 'LLM: GPT OSS 20B (Fallback)', isFallback: true };
+  }
+  if (m.includes('qwen')) {
+    return { label: 'LLM: Qwen (Fallback)', isFallback: true };
+  }
+  return { label: `LLM: ${model}`, isFallback: false };
 }
 
 export const SqlCodeEditor: React.FC<SqlCodeEditorProps> = ({
@@ -18,6 +34,7 @@ export const SqlCodeEditor: React.FC<SqlCodeEditorProps> = ({
   onExplain,
   onOpenCorrection,
   isExecuting = false,
+  modelUsed,
 }) => {
   const [copied, setCopied] = useState(false);
   const [isEditable, setIsEditable] = useState(false);
@@ -95,7 +112,19 @@ export const SqlCodeEditor: React.FC<SqlCodeEditorProps> = ({
           <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-white border border-[#E4EAEA] text-[11px] font-bold text-[#142337]">
             <span>PostgreSQL 16</span>
           </div>
-          <span className="text-xs text-[#64748B] font-mono">generated_query.sql</span>
+          {modelUsed && (
+            <div className={`flex items-center gap-1.5 px-2.5 py-1 rounded-md border text-[11px] font-bold transition-all ${
+              formatLLMLabel(modelUsed).isFallback
+                ? 'bg-[#FEF3C7] border-[#FCD34D] text-[#92400E]'
+                : 'bg-[#F0FDF4] border-[#BBF7D0] text-[#166534]'
+            }`}>
+              <span className={`w-1.5 h-1.5 rounded-full ${
+                formatLLMLabel(modelUsed).isFallback ? 'bg-[#D97706]' : 'bg-[#16A36A]'
+              }`} />
+              <span>{formatLLMLabel(modelUsed).label}</span>
+            </div>
+          )}
+          <span className="text-xs text-[#64748B] font-mono hidden sm:inline">generated_query.sql</span>
         </div>
 
         {/* Action Controls */}
@@ -159,7 +188,7 @@ export const SqlCodeEditor: React.FC<SqlCodeEditorProps> = ({
           />
         ) : (
           <div className="table w-full">
-            {highlightSql(sql)}
+            {highlightSql(sql || '-- No SQL generated for this query (see explanation below)')}
           </div>
         )}
       </div>

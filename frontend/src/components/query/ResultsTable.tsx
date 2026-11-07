@@ -196,7 +196,7 @@ export const ResultsTable: React.FC<ResultsTableProps> = ({
                 ))
               ) : (
                 <tr>
-                  <td colSpan={columns.length} className="py-8 text-center text-[#94A3B8]">
+                  <td colSpan={Math.max(columns.length, 1)} className="py-8 text-center text-[#94A3B8]">
                     No rows returned from query
                   </td>
                 </tr>

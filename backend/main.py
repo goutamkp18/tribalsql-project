@@ -168,7 +168,7 @@ def health_check():
         },
         "llm": {
             "groq_configured": is_groq_configured(),
-            "primary_model": GROQ_PRIMARY_MODEL
+            "primary_model": os.getenv("GROQ_PRIMARY_MODEL", GROQ_PRIMARY_MODEL)
         }
     }
 

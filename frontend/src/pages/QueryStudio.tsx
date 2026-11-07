@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { PromptBar } from '../components/query/PromptBar';
-import { SqlCodeEditor } from '../components/query/SqlCodeEditor';
+import { SqlCodeEditor, formatLLMLabel } from '../components/query/SqlCodeEditor';
 import { MemoryRecallBanner } from '../components/query/MemoryRecallBanner';
 import { ResultsTable } from '../components/query/ResultsTable';
 import { ExplanationPanel } from '../components/query/ExplanationPanel';
@@ -44,21 +44,43 @@ export const QueryStudio: React.FC<QueryStudioProps> = ({ initialQuery = '' }) =
   const handleGenerate = async (q: string, overrideUseMemory?: boolean) => {
     const memoryFlag = overrideUseMemory !== undefined ? overrideUseMemory : useMemory;
     setIsGenerating(true);
+    // Clear stale results immediately upon submission
+    setQueryResult(null);
+    setEditableSql('');
+
     try {
       const res = await generateSQL(q, memoryFlag);
       setQueryResult(res.data);
-      setEditableSql(res.data.generatedSql);
+      setEditableSql(res.data.generatedSql || '');
       const isLive = res.source === 'fastapi';
       showToast(
         memoryFlag 
           ? (isLive ? 'SQL Generated (Hindsight Memory Active)' : 'SQL Generated (Mock)') 
           : 'SQL Generated (Cold Start Mode)',
-        memoryFlag 
-          ? 'Recalled institutional rules via Groq LLM & Hindsight Cloud' 
-          : 'Generated purely from raw schema DDL (Cold Start)',
+        res.data.generatedSql
+          ? (memoryFlag 
+              ? 'Recalled institutional rules via Groq LLM & Hindsight Cloud' 
+              : 'Generated purely from raw schema DDL (Cold Start)')
+          : (res.data.explanation || 'Schema Boundary: Missing schema entity requested'),
         memoryFlag ? 'success' : 'warning'
       );
     } catch (err: any) {
+      setQueryResult({
+        id: `err-${Date.now()}`,
+        naturalQuery: q,
+        status: 'failed',
+        executionTimeMs: 0,
+        rowCount: 0,
+        recalledMemories: [],
+        businessRulesUsed: [],
+        generatedSql: '',
+        explanation: err?.message || 'Failed to generate SQL query.',
+        columns: [],
+        rows: [],
+        error: err?.message || 'SQL generation failed',
+        demoDataNotice: 'Failed query generation attempt.',
+        useMemory: memoryFlag
+      });
       showToast('Error generating SQL', err?.message || 'Please check backend connection', 'error');
     } finally {
       setIsGenerating(false);
@@ -66,21 +88,32 @@ export const QueryStudio: React.FC<QueryStudioProps> = ({ initialQuery = '' }) =
   };
 
   const handleExecute = async () => {
-    if (!editableSql) return;
+    if (!editableSql.trim()) return;
     setIsExecuting(true);
     try {
       const res = await executeSQL(editableSql);
-      if (queryResult) {
-        setQueryResult({
-          ...queryResult,
-          columns: res.data.columns,
-          rows: res.data.rows,
-          executionTimeMs: res.data.executionTimeMs,
-          status: 'success',
-        });
-      }
-      showToast('Query Executed Successfully', `Returned results in ${res.data.executionTimeMs}ms (${res.source === 'fastapi' ? 'Live DB' : 'Simulated'})`, 'success');
+      setQueryResult(prev => prev ? ({
+        ...prev,
+        columns: res.data.columns || [],
+        rows: res.data.rows || [],
+        rowCount: (res.data as any).rowCount ?? res.data.rows?.length ?? 0,
+        executionTimeMs: res.data.executionTimeMs,
+        status: 'success',
+        error: undefined,
+      }) : null);
+      showToast(
+        'Query Executed Successfully',
+        `Returned ${res.data.rows?.length || 0} rows in ${res.data.executionTimeMs}ms (${res.source === 'fastapi' ? 'Live DB' : 'Simulated'})`,
+        'success'
+      );
     } catch (err: any) {
+      setQueryResult(prev => prev ? ({
+        ...prev,
+        rows: [],
+        rowCount: 0,
+        status: 'failed',
+        error: err?.message || 'Query execution failed',
+      }) : null);
       showToast('Query Execution Failed', err?.message || 'Check syntax or permissions', 'error');
     } finally {
       setIsExecuting(false);
@@ -105,6 +138,18 @@ export const QueryStudio: React.FC<QueryStudioProps> = ({ initialQuery = '' }) =
           <Badge variant={getApiMode() === 'live' ? 'emerald' : 'orange'} dot>
             {getApiMode() === 'live' ? 'Live Backend Active' : 'Mock Demo Mode'}
           </Badge>
+          {queryResult?.modelUsed && (
+            <div className={`flex items-center gap-1.5 px-3 py-1 rounded-full border text-xs font-semibold ${
+              formatLLMLabel(queryResult.modelUsed).isFallback
+                ? 'bg-[#FEF3C7] border-[#FCD34D] text-[#92400E]'
+                : 'bg-[#F0FDF4] border-[#BBF7D0] text-[#166534]'
+            }`}>
+              <span className={`w-2 h-2 rounded-full ${
+                formatLLMLabel(queryResult.modelUsed).isFallback ? 'bg-[#D97706]' : 'bg-[#16A36A]'
+              }`} />
+              <span>{formatLLMLabel(queryResult.modelUsed).label}</span>
+            </div>
+          )}
           <div className="flex items-center gap-1.5 px-3 py-1 rounded-full bg-[#ECFDF5] border border-[#A7F3D0] text-xs font-semibold text-[#16A36A]">
             <span className="w-2 h-2 rounded-full bg-[#16A36A] animate-pulse" />
             <span>Memory Guardrails Active</span>
@@ -148,6 +193,7 @@ export const QueryStudio: React.FC<QueryStudioProps> = ({ initialQuery = '' }) =
             onExplain={() => setIsExplainOpen(true)}
             onOpenCorrection={() => setIsCorrectionOpen(true)}
             isExecuting={isExecuting}
+            modelUsed={queryResult.modelUsed}
           />
 
           {/* Results Table & Visualizations */}
