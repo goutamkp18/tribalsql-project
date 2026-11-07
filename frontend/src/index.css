@@ -1,0 +1,53 @@
+@import "tailwindcss";
+
+@layer base {
+  :root {
+    --color-powder-blue: #A8C9C8;
+    --color-pure-white: #FFFFFF;
+    --color-racing-orange: #F45B0B;
+    --color-dark-navy: #142337;
+    --color-soft-grey: #F5F7F7;
+    --color-border-grey: #E4EAEA;
+    --color-success-green: #16A36A;
+    --color-error-red: #E5484D;
+  }
+
+  body {
+    background-color: #F5F7F7;
+    color: #142337;
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    overflow-x: hidden;
+  }
+}
+
+/* Custom modern scrollbars */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: #F5F7F7;
+}
+::-webkit-scrollbar-thumb {
+  background: #CBD5E1;
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #94A3B8;
+}
+
+/* Monospace font styling for code & SQL */
+.font-mono-code {
+  font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+
+/* Utility borders and cards */
+.card-clean {
+  background: #FFFFFF;
+  border: 1px solid #E4EAEA;
+  box-shadow: 0 1px 3px 0 rgba(20, 35, 55, 0.03), 0 1px 2px -1px rgba(20, 35, 55, 0.02);
+}
+
+.card-hover:hover {
+  box-shadow: 0 4px 6px -1px rgba(20, 35, 55, 0.05), 0 2px 4px -2px rgba(20, 35, 55, 0.03);
+}
