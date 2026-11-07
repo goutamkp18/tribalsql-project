@@ -1,5 +1,5 @@
 import React from 'react';
-import { Clock, ArrowRight } from 'lucide-react';
+import { Clock, ArrowRight, Database } from 'lucide-react';
 import { QueryHistoryItem } from '../../types';
 
 interface RecentQueriesListProps {
@@ -29,46 +29,56 @@ export const RecentQueriesList: React.FC<RecentQueriesListProps> = ({
         </button>
       </div>
 
-      <div className="overflow-x-auto">
-        <table className="w-full text-left text-xs border-collapse">
-          <thead>
-            <tr className="border-b border-[#E4EAEA] text-[#64748B] font-semibold">
-              <th className="py-2 px-2 w-8">#</th>
-              <th className="py-2 px-2">Query</th>
-              <th className="py-2 px-2">Status</th>
-              <th className="py-2 px-2 text-right">Time</th>
-            </tr>
-          </thead>
-          <tbody className="divide-y divide-[#E4EAEA]/70">
-            {queries.map((q, idx) => (
-              <tr
-                key={q.id}
-                onClick={() => onSelectQuery(q.query)}
-                className="hover:bg-[#F5F7F7] transition-colors cursor-pointer group"
-              >
-                <td className="py-2.5 px-2 text-[#64748B] font-medium">{idx + 1}</td>
-                <td className="py-2.5 px-2 font-medium text-[#142337] group-hover:text-[#F45B0B] transition-colors line-clamp-1 max-w-[210px]">
-                  {q.query}
-                </td>
-                <td className="py-2.5 px-2 whitespace-nowrap">
-                  {q.status === 'success' ? (
-                    <span className="inline-flex items-center gap-1 text-[10px] font-semibold text-[#16A36A] bg-[#ECFDF5] border border-[#A7F3D0] px-2 py-0.5 rounded-full">
-                      ✓ Success
-                    </span>
-                  ) : (
-                    <span className="inline-flex items-center gap-1 text-[10px] font-semibold text-[#E5484D] bg-[#FEF2F2] border border-[#FECDD3] px-2 py-0.5 rounded-full">
-                      ✕ Failed
-                    </span>
-                  )}
-                </td>
-                <td className="py-2.5 px-2 text-right text-[11px] text-[#64748B] whitespace-nowrap">
-                  {q.timestamp}
-                </td>
+      {queries.length === 0 ? (
+        <div className="py-8 flex flex-col items-center justify-center text-center">
+          <Database className="w-8 h-8 text-[#A8C9C8] mb-2 stroke-[1.5]" />
+          <p className="text-xs font-semibold text-[#142337]">No queries recorded yet</p>
+          <p className="text-[11px] text-[#64748B] mt-0.5">
+            Run a natural-language query in Query Studio to log real production telemetry.
+          </p>
+        </div>
+      ) : (
+        <div className="overflow-x-auto">
+          <table className="w-full text-left text-xs border-collapse">
+            <thead>
+              <tr className="border-b border-[#E4EAEA] text-[#64748B] font-semibold">
+                <th className="py-2 px-2 w-8">#</th>
+                <th className="py-2 px-2">Query</th>
+                <th className="py-2 px-2">Status</th>
+                <th className="py-2 px-2 text-right">Time</th>
               </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
+            </thead>
+            <tbody className="divide-y divide-[#E4EAEA]/70">
+              {queries.map((q, idx) => (
+                <tr
+                  key={q.id}
+                  onClick={() => onSelectQuery(q.query)}
+                  className="hover:bg-[#F5F7F7] transition-colors cursor-pointer group"
+                >
+                  <td className="py-2.5 px-2 text-[#64748B] font-medium">{idx + 1}</td>
+                  <td className="py-2.5 px-2 font-medium text-[#142337] group-hover:text-[#F45B0B] transition-colors line-clamp-1 max-w-[210px]">
+                    {q.query}
+                  </td>
+                  <td className="py-2.5 px-2 whitespace-nowrap">
+                    {q.status === 'success' ? (
+                      <span className="inline-flex items-center gap-1 text-[10px] font-semibold text-[#16A36A] bg-[#ECFDF5] border border-[#A7F3D0] px-2 py-0.5 rounded-full">
+                        ✓ Success
+                      </span>
+                    ) : (
+                      <span className="inline-flex items-center gap-1 text-[10px] font-semibold text-[#E5484D] bg-[#FEF2F2] border border-[#FECDD3] px-2 py-0.5 rounded-full">
+                        ✕ Failed
+                      </span>
+                    )}
+                  </td>
+                  <td className="py-2.5 px-2 text-right text-[11px] text-[#64748B] whitespace-nowrap">
+                    {q.timestamp}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
     </div>
   );
 };

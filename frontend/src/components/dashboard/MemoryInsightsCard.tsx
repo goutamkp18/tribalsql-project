@@ -9,12 +9,16 @@ interface MemoryInsightsCardProps {
     mentalModels: number;
   };
   onOpenMemoryInspector: () => void;
+  status?: string;
 }
 
 export const MemoryInsightsCard: React.FC<MemoryInsightsCardProps> = ({
   counts,
   onOpenMemoryInspector,
+  status = 'connected',
 }) => {
+  const isOffline = status === 'unavailable' || status === 'error';
+
   const items = [
     { label: 'Business Rules', count: counts.businessRules, icon: <FileText className="w-4 h-4 text-[#F45B0B]" /> },
     { label: 'SQL Fixes', count: counts.sqlFixes, icon: <Code2 className="w-4 h-4 text-[#F45B0B]" /> },
@@ -25,24 +29,37 @@ export const MemoryInsightsCard: React.FC<MemoryInsightsCardProps> = ({
   return (
     <div className="p-6 rounded-2xl bg-white border border-[#E4EAEA] shadow-xs flex flex-col justify-between h-full">
       <div>
-        <div className="flex items-center gap-2 text-[#142337] font-bold text-sm mb-4">
-          <Layers className="w-4 h-4 text-[#F45B0B]" />
-          <span>Memory Insights</span>
+        <div className="flex items-center justify-between mb-4">
+          <div className="flex items-center gap-2 text-[#142337] font-bold text-sm">
+            <Layers className="w-4 h-4 text-[#F45B0B]" />
+            <span>Memory Insights</span>
+          </div>
+          {isOffline && (
+            <span className="text-[10px] font-semibold text-[#E5484D] bg-[#FEF2F2] border border-[#FECDD3] px-2 py-0.5 rounded-full">
+              Offline
+            </span>
+          )}
         </div>
 
-        <div className="space-y-3">
-          {items.map((it) => (
-            <div key={it.label} className="flex items-center justify-between text-xs py-1 border-b border-[#E4EAEA]/70 last:border-none">
-              <div className="flex items-center gap-2.5">
-                {it.icon}
-                <span className="text-[#142337] font-medium">{it.label}</span>
+        {isOffline ? (
+          <div className="py-6 text-center text-xs text-[#64748B]">
+            Hindsight Cloud memory is currently offline. Connect API key to inspect live bank rules.
+          </div>
+        ) : (
+          <div className="space-y-3">
+            {items.map((it) => (
+              <div key={it.label} className="flex items-center justify-between text-xs py-1 border-b border-[#E4EAEA]/70 last:border-none">
+                <div className="flex items-center gap-2.5">
+                  {it.icon}
+                  <span className="text-[#142337] font-medium">{it.label}</span>
+                </div>
+                <span className="font-bold text-[#142337] font-mono">
+                  {it.count}
+                </span>
               </div>
-              <span className="font-bold text-[#142337] font-mono">
-                {it.count}
-              </span>
-            </div>
-          ))}
-        </div>
+            ))}
+          </div>
+        )}
       </div>
 
       <button

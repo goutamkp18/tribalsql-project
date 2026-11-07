@@ -217,12 +217,9 @@ export async function getRetainedMemories(): Promise<ApiResponse<RetainedMemory[
     }
   );
 
-  if (response.source === 'fastapi' && response.data && Array.isArray(response.data) && response.data.length > 0) {
+  if (response.source === 'fastapi' && response.data && Array.isArray(response.data)) {
     return response as ApiResponse<RetainedMemory[]>;
   }
 
-  return {
-    ...response,
-    data: mockRetainedMemories,
-  };
+  return response;
 }

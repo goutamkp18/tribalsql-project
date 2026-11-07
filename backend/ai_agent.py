@@ -423,6 +423,20 @@ Translate the user's natural language question into an accurate, safe PostgreSQL
                 results_summary=f"Returned {exec_result.get('row_count', 0)} rows in {exec_result.get('execution_time_ms', 0)}ms."
             )
 
+            # Step E: Log into production query_logs table
+            try:
+                from analytics import log_query_execution
+                log_query_execution(
+                    natural_language_query=question,
+                    generated_sql=candidate_sql,
+                    execution_status="SUCCESS",
+                    execution_time_ms=exec_result.get("execution_time_ms", 0.0),
+                    rows_returned=exec_result.get("row_count", 0),
+                    used_hindsight_memory=use_memory
+                )
+            except Exception as e_log:
+                logger.warning(f"Failed to record analytics log: {e_log}")
+
             # Success response
             return {
                 "sql": candidate_sql,
@@ -469,6 +483,21 @@ Translate the user's natural language question into an accurate, safe PostgreSQL
                     f"Please self-heal and fix the SQL query according to NovaMart rules. Return valid JSON only."
                 )
             })
+
+    # If retries exhausted, log failure to production query_logs table
+    try:
+        from analytics import log_query_execution
+        log_query_execution(
+            natural_language_query=question,
+            generated_sql=candidate_sql or "None",
+            execution_status="FAILED",
+            execution_time_ms=0.0,
+            rows_returned=0,
+            error_message=last_error,
+            used_hindsight_memory=use_memory
+        )
+    except Exception as e_log:
+        logger.warning(f"Failed to record analytics log for query failure: {e_log}")
 
     # If retries exhausted, return failed structure
     return {

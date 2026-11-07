@@ -239,10 +239,48 @@ def execute_sql_endpoint(req: ExecuteSQLRequest):
         validate_sql_with_sqlglot(req.sql)
         # Execute query
         result = execute_readonly_sql(req.sql)
+        try:
+            from analytics import log_query_execution
+            log_query_execution(
+                natural_language_query=req.sql,
+                generated_sql=req.sql,
+                execution_status="SUCCESS",
+                execution_time_ms=result.get("execution_time_ms", 0.0),
+                rows_returned=result.get("row_count", 0),
+                used_hindsight_memory=False
+            )
+        except Exception:
+            pass
         return result
     except ValueError as ve:
+        try:
+            from analytics import log_query_execution
+            log_query_execution(
+                natural_language_query=req.sql,
+                generated_sql=req.sql,
+                execution_status="VALIDATION_ERROR",
+                execution_time_ms=0.0,
+                rows_returned=0,
+                error_message=str(ve),
+                used_hindsight_memory=False
+            )
+        except Exception:
+            pass
         raise HTTPException(status_code=400, detail=f"Safety or syntax error: {ve}")
     except Exception as e:
+        try:
+            from analytics import log_query_execution
+            log_query_execution(
+                natural_language_query=req.sql,
+                generated_sql=req.sql,
+                execution_status="FAILED",
+                execution_time_ms=0.0,
+                rows_returned=0,
+                error_message=str(e),
+                used_hindsight_memory=False
+            )
+        except Exception:
+            pass
         raise HTTPException(status_code=500, detail=f"Database execution error: {e}")
 
 
@@ -265,6 +303,55 @@ def full_query_endpoint(req: QueryRequest):
             use_memory=req.use_memory
         )
         return gen_result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# -----------------------------------------------------------------------------
+# Production Dashboard Analytics Endpoints (Phase 2 & Phase 3)
+# -----------------------------------------------------------------------------
+
+@app.get("/api/dashboard/analytics")
+@app.get("/api/v1/analytics/dashboard")
+def get_dashboard_analytics_endpoint(days: int = 7):
+    """
+    Returns production dashboard metrics backed 100% by Supabase PostgreSQL
+    (query_logs, learning_events) and Hindsight Cloud.
+    """
+    try:
+        from analytics import get_dashboard_analytics
+        data = get_dashboard_analytics(days=days)
+        return data
+    except Exception as e:
+        logger.error(f"Error fetching dashboard analytics: {e}")
+        raise HTTPException(status_code=500, detail=f"Analytics error: {e}")
+
+
+@app.get("/api/v1/analytics/queries/recent")
+def get_recent_queries_endpoint(limit: int = 10):
+    try:
+        from analytics import get_dashboard_analytics
+        data = get_dashboard_analytics()
+        return data.get("recentQueries", [])[:limit]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/v1/analytics/learning/recent")
+def get_recent_learning_endpoint(limit: int = 10):
+    try:
+        from analytics import get_dashboard_analytics
+        data = get_dashboard_analytics()
+        return data.get("recentLearning", [])[:limit]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/v1/memory/stats")
+def get_memory_stats_endpoint():
+    try:
+        from analytics import get_hindsight_live_stats
+        return get_hindsight_live_stats()
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -295,6 +382,18 @@ def human_correction_endpoint(req: HumanCorrectionRequest):
             corrected_sql=corrected,
             business_rule=rule
         )
+
+        # Safely log to PostgreSQL learning_events (Phase 2)
+        try:
+            from analytics import log_learning_event
+            log_learning_event(
+                correction_text=rule or f"{q}: {corrected}",
+                category=req.categoryTag or req.type or "business_rule",
+                verification_status="verified"
+            )
+        except Exception as e_ev:
+            logger.warning(f"Failed to record learning event: {e_ev}")
+
         return {
             "status": "success",
             "message": "Human correction retained in Hindsight Memory.",
